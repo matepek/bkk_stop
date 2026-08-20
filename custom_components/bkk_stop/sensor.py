@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+from urllib.parse import urlencode
 from datetime import timedelta
 from datetime import datetime
 import logging
@@ -26,6 +27,7 @@ CONF_HEADSIGNS = 'headsigns'
 CONF_IGNORENOW = 'ignoreNow'
 CONF_INPREDICTED = 'inPredicted'
 CONF_MINSAFTER = 'minsAfter'
+CONF_MINRESULT = "minResult"    
 CONF_MAXITEMS = 'maxItems'
 CONF_ROUTES = 'routes'
 CONF_STOPID = 'stopId'
@@ -50,7 +52,7 @@ SCAN_INTERVAL = timedelta(seconds=120)
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(ATTR_ENTITY_ID, default=''): cv.string,
     vol.Required(CONF_APIKEY): cv.string,
-    vol.Required(CONF_STOPID): cv.string,
+    vol.Required(CONF_STOPID): vol.All(cv.ensure_list, [cv.string]),
     vol.Optional(CONF_BIKES, default=False): cv.boolean,
     vol.Optional(CONF_COLORS, default=False): cv.boolean,
     vol.Optional(CONF_HEADSIGNS, default=[]): vol.All(cv.ensure_list, [cv.string]),
@@ -58,6 +60,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_INPREDICTED, default='false'): cv.boolean,
     vol.Optional(CONF_MAXITEMS, default=0): cv.string,
     vol.Optional(CONF_MINSAFTER, default=20): cv.string,
+    vol.Optional(CONF_MINRESULT, default=0): cv.string,
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Optional(CONF_ROUTES, default=[]): vol.All(cv.ensure_list, [cv.string]),
     vol.Optional(CONF_MINSBEFORE, default=0): cv.string,
@@ -72,6 +75,7 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
     stopid = config.get(CONF_STOPID)
     maxitems = config.get(CONF_MAXITEMS)
     minsafter = config.get(CONF_MINSAFTER)
+    minresult = config.get(CONF_MINRESULT)
     wheelchair = config.get(CONF_WHEELCHAIR)
     bikes = config.get(CONF_BIKES)
     colors = config.get(CONF_COLORS)
@@ -83,14 +87,14 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
     apikey = config.get(CONF_APIKEY)
 
     async_add_devices(
-        [BKKPublicTransportSensor(hass, name, entityid, stopid, minsafter, wheelchair, bikes, colors, ignorenow, maxitems, routes, inpredicted, apikey, headsigns, minsbefore)],update_before_add=True)
+        [BKKPublicTransportSensor(hass, name, entityid, stopid, minsafter, minresult, wheelchair, bikes, colors, ignorenow, maxitems, routes, inpredicted, apikey, headsigns, minsbefore)],update_before_add=True)
 
 def _sleep(secs):
     time.sleep(secs)
 
 class BKKPublicTransportSensor(Entity):
 
-    def __init__(self, hass, name, entityid, stopid, minsafter, wheelchair, bikes, colors, ignorenow, maxitems, routes, inpredicted, apikey, headsigns, minsbefore):
+    def __init__(self, hass, name, entityid, stopid, minsafter, minresult, wheelchair, bikes, colors, ignorenow, maxitems, routes, inpredicted, apikey, headsigns, minsbefore):
 
         async def handle_refresh(call: ServiceCall) -> None:
             """Handle the refresh service call."""
@@ -103,6 +107,7 @@ class BKKPublicTransportSensor(Entity):
         self._stopid = stopid
         self._maxitems = maxitems
         self._minsafter = minsafter
+        self._minresult = minresult
         self._wheelchair = wheelchair
         self._bikes = bikes
         self._colors = colors
@@ -142,9 +147,9 @@ class BKKPublicTransportSensor(Entity):
         else:
               return None
 
-        bkkjson["stationName"] = bkkdata["data"]["references"]["stops"][self._stopid]["name"]
-        bkkjson["vehicles"] = []
-        failedNode = 0
+        stationNames = sorted({s["name"] for s in bkkdata["data"]["references"]["stops"].values()})
+        bkkjson["stationName"] = ", ".join(stationNames)
+        vehicles = []
 
         if len(bkkdata["data"]["entry"]["stopTimes"]) != 0:
           currenttime = int(bkkdata["currentTime"] / 1000)
@@ -166,7 +171,7 @@ class BKKPublicTransportSensor(Entity):
             predicted_attime = stopTime.get("predictedDepartureTime")
 
             stopdata = {}
-            stopdata["in"] = str(diff)
+            stopdata["in"] = diff
             stopdata["type"] = bkkdata["data"]["references"]["routes"][routeid]["type"]
             stopdata["routeid"] = bkkdata["data"]["references"]["routes"][routeid]["iconDisplayText"]
             if len(self._routes) != 0 and stopdata["routeid"] not in self._routes:
@@ -192,23 +197,39 @@ class BKKPublicTransportSensor(Entity):
                if 'textColor' in bkkdata["data"]["references"]["routes"][routeid]:
                 stopdata["textcolor"] = bkkdata["data"]["references"]["routes"][routeid]["textColor"]
 
-            bkkjson["vehicles"].append(stopdata)
+            vehicles.append(stopdata)
             if int(self._maxitems) > 0:
                itemnr += 1
                if itemnr >= int(self._maxitems):
                   break
+
+        bkkjson["vehicles"] = sorted(vehicles, key=lambda x:x["in"])
         dt_now = datetime.now()
         bkkjson["updatedAt"] = dt_now.strftime("%Y/%m/%d %H:%M")
         if 'vehicles' in bkkjson and len(bkkjson["vehicles"]) > 0:
            self._state = bkkjson["vehicles"][0]["in"]
+
+        bkkjson["vehicles"]
 
         return bkkjson
 
     async def async_update(self):
         _session = async_get_clientsession(self._hass)
 
-        _LOGGER.debug("bkk_stop update for " + self._stopid)
-        BKKURL="https://go.bkk.hu/api/query/v1/ws/otp/api/where/arrivals-and-departures-for-stop.json?key=" + self._apikey + "&version=3&appVersion=apiary-1.0&onlyDepartures=true&stopId=" + self._stopid + "&minutesAfter=" + self._minsafter + "&minutesBefore=" + self._minsbefore
+        _LOGGER.debug("bkk_stop update for " + ",".join(self._stopid))
+        params = {
+            "key": self._apikey,
+            "version": "3",
+            "appVersion": "apiary-1.1",
+            "onlyDepartures": "true",
+            "stopId": self._stopid if isinstance(self._stopid, list) else [self._stopid],
+            "minutesAfter": self._minsafter,
+            "minutesBefore": self._minsbefore,
+            "minResult": self._minresult,
+        }
+        clean_params = {k: v for k, v in params.items() if v is not None}
+        base_url = "https://go.bkk.hu/api/query/v1/ws/otp/api/where/arrivals-and-departures-for-stop.json"
+        BKKURL = f"{base_url}?{urlencode(clean_params, doseq=True)}"
 
         for i in range(MAX_RETRIES):
           try:
@@ -237,7 +258,7 @@ class BKKPublicTransportSensor(Entity):
         else:
            self._state = None
 
-        _LOGGER.debug("bkk_stop updated for " + self._stopid + ": " + str(self._state))
+        _LOGGER.debug("bkk_stop updated for " + ",".join(self._stopid) + ": " + str(self._state))
 
         return self._state
 
